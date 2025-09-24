@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from astrbot.api.star import register, Star, Context
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 import astrbot.api.message_components as Comp
-from astrbot import logger
+from astrbot.api import logger
 
 SAKURA_WS_URLS = [
     "ws://43.143.53.96:5000/onebot/v11/ws",    # 娱乐功能
@@ -26,6 +26,7 @@ class SakuraBridge(Star):
         
     @filter.on_astrbot_loaded()
     async def _boot(self):
+        logger.info("[sakurabridge] on_astrbot_loaded fired, preparing WS clients")
         import websockets
         if not SAKURA_WS_URLS:
             logger.warning("[sakurabridge] 请先在 main.py 中填写 SAKURA_WS_URLS")
@@ -115,6 +116,7 @@ class SakuraBridge(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def _forward_to_sakura(self, event: AstrMessageEvent):
+        logger.debug(f"[sakurabridge] got message: {event.message_str!r}")
         if event.get_group_id():
             gid_official = event.get_group_id()
             gid_onebot   = GROUP_ID_MAP.get(gid_official, gid_official)
@@ -129,6 +131,8 @@ class SakuraBridge(Star):
         send_tasks = [ws.send(payload) for ws in list(self._ws_peers)]
         if send_tasks:
             await asyncio.gather(*send_tasks, return_exceptions=True)
+        else:
+            logger.warning("[sakurabridge] no active Sakura WS peers; did on_astrbot_loaded run?")
 
     def _make_onebot_message_event(self, event: AstrMessageEvent) -> Dict[str, Any]:
         is_group = bool(event.get_group_id())
@@ -157,3 +161,7 @@ class SakuraBridge(Star):
                 "nickname": event.get_sender_name(),
             }
         }
+
+    @filter.command("sbping")
+    async def _sbping(self, event: AstrMessageEvent):
+        yield event.plain_result("sakurabridge: pong")
