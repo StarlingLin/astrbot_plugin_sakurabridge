@@ -55,6 +55,7 @@ class SakuraBridge(Star):
         self._last_ws_err: Dict[str, str] = {}
         self._last_ws_status: Dict[str, str] = {}  # connecting/open/closed
         self._self_id: str = "astrbot"  # 尽力填充
+        self._ws_lib_ver: str = ""
 
     async def _ensure_ws_started(self):
         """确保已启动到 Sakura 的 WS 客户端（兼容 on_loaded 不触发的情况）。"""
@@ -66,6 +67,7 @@ class SakuraBridge(Star):
             return
         try:
             import websockets  # 延迟导入，只有需要时才加载依赖
+            self._ws_lib_ver = getattr(websockets, "__version__", "unknown")
         except Exception as e:
             self._last_ws_err["__import__"] = f"websockets 导入失败: {e}"
             logger.error(f"[sakurabridge] websockets 依赖未安装或导入失败: {e}")
@@ -99,8 +101,7 @@ class SakuraBridge(Star):
                 logger.info(f"[sakurabridge] connect {url}")
                 async with websockets.connect(
                     url,
-                    extra_headers=headers,
-                    subprotocols=["onebot.v11"],  # 很多 OneBot 服务端要求该子协议
+                    subprotocols=["onebot.v11"],  # 优先使用 onebot.v11 子协议（多数服务端支持）
                     ping_interval=30,
                     ping_timeout=30,
                     max_size=8 * 1024 * 1024,
@@ -264,6 +265,9 @@ class SakuraBridge(Star):
             txt += "last_errors:" + "; ".join([f"{k}={v}" for k, v in self._last_ws_err.items()])
         if self._last_ws_status:
             txt += "status:" + "; ".join([f"{k}={v}" for k, v in self._last_ws_status.items()])
+        # 附带 websockets 库版本
+        if self._ws_lib_ver:
+            txt += f"\nwebsockets: {self._ws_lib_ver}"
         yield event.plain_result(f"sakurabridge: {txt}")
 
     # --- 动态添加 WS：@机器人 /sblink <ws-url> ---
@@ -294,4 +298,5 @@ class SakuraBridge(Star):
             lines.append(f"{url} -> {st}{' | ' + err if err else ''}")
         if not lines:
             lines = ["(no urls configured)"]
-        yield event.plain_result("".join(lines))
+        lines.append(f"websockets: {self._ws_lib_ver or 'unknown'}")
+        yield event.plain_result("\n".join(lines))
