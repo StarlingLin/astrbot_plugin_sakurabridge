@@ -1,19 +1,21 @@
 import asyncio, json, time, uuid
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode, urlparse, urlunparse, parse_qsl
 
 from astrbot.api.star import register, Star, Context
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
 
-# === Sakura 反向 WS 地址 ===
+# === Sakura 反向 OneBot WS 地址（按需增删） ===
 SAKURA_WS_URLS = [
     "ws://43.143.53.96:5000/onebot/v11/ws",      # 娱乐功能
     "ws://101.34.19.31:13888/onebot/v11/ws",     # pjsk
     "ws://121.41.63.60:11735/pub/onebotSocket",  # osu
 ]
-SAKURA_ACCESS_TOKEN = ""
+SAKURA_ACCESS_TOKEN = ""  # 可为空；若远端要求鉴权，按需填写
 
+# ✅ （可选）手动 ID 映射：AstrBot 官方通道的 group_id -> OneBot 期望的群号字符串
 #    留空即可运行，但某些依赖精确 QQ 群号/QQ 号的功能可能不可用或降级。
 GROUP_ID_MAP: Dict[str, str] = {
     # "official_group_id_abc": "123456789",
@@ -24,7 +26,18 @@ def _now_ts() -> int:
     return int(time.time())
 
 
-@register("sakurabridge", "your_name", "Bridge to Sakura OneBot v11", "0.1.0")
+def _with_token(url: str, token: str) -> str:
+    """将 access_token 追加为查询参数（有些 OneBot 端用这个方式校验）。"""
+    if not token:
+        return url
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query, keep_blank_values=True))
+    if "access_token" not in q:
+        q["access_token"] = token
+    return urlunparse((u.scheme, u.netloc, u.path, u.params, urlencode(q), u.fragment))
+
+
+@register("sakurabridge", "your_name", "Bridge to Sakura OneBot v11", "0.2.0")
 class SakuraBridge(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -38,6 +51,10 @@ class SakuraBridge(Star):
         self.group_id_map: Dict[str, str] = GROUP_ID_MAP
         # 懒启动标志：即使 on_loaded 不触发，也能在首次收到消息时启动 WS
         self._ws_started: bool = False
+        # 运行状态/诊断
+        self._last_ws_err: Dict[str, str] = {}
+        self._last_ws_status: Dict[str, str] = {}  # connecting/open/closed
+        self._self_id: str = "astrbot"  # 尽力填充
 
     async def _ensure_ws_started(self):
         """确保已启动到 Sakura 的 WS 客户端（兼容 on_loaded 不触发的情况）。"""
@@ -50,9 +67,11 @@ class SakuraBridge(Star):
         try:
             import websockets  # 延迟导入，只有需要时才加载依赖
         except Exception as e:
+            self._last_ws_err["__import__"] = f"websockets 导入失败: {e}"
             logger.error(f"[sakurabridge] websockets 依赖未安装或导入失败: {e}")
             return
-        for url in SAKURA_WS_URLS:
+        for raw_url in SAKURA_WS_URLS:
+            url = _with_token(raw_url, SAKURA_ACCESS_TOKEN)
             logger.info(f"[sakurabridge] (lazy) connect {url}")
             self._ws_tasks.append(asyncio.create_task(self._run_onebot_client(url)))
 
@@ -63,18 +82,35 @@ class SakuraBridge(Star):
         await self._ensure_ws_started()
 
     async def _run_onebot_client(self, url: str):
-        import websockets
+        # 局部导入，确保 requirements 存在时才执行
+        import websockets  # type: ignore
         backoff = 1
         while True:
             try:
-                headers = {}
+                self._last_ws_status[url] = "connecting"
+                headers = {
+                    "User-Agent": "astrbot_sakurabridge/0.2",
+                    # 反向 WS 常见握手头（并非所有端都要求）：
+                    "X-Client-Role": "Universal",
+                    "X-Self-ID": self._self_id,
+                }
                 if SAKURA_ACCESS_TOKEN:
-                    headers["Authorization"] = f"Bearer {SAKURA_ACCESS_TOKEN}"
+                    headers.setdefault("Authorization", f"Bearer {SAKURA_ACCESS_TOKEN}")
                 logger.info(f"[sakurabridge] connect {url}")
-                async with websockets.connect(url, extra_headers=headers) as ws:
+                async with websockets.connect(
+                    url,
+                    extra_headers=headers,
+                    subprotocols=["onebot.v11"],  # 很多 OneBot 服务端要求该子协议
+                    ping_interval=30,
+                    ping_timeout=30,
+                    max_size=8 * 1024 * 1024,
+                ) as ws:
                     self._ws_peers.add(ws)
+                    self._last_ws_status[url] = "open"
                     await self._listen_actions(ws)
             except Exception as e:
+                self._last_ws_status[url] = "closed"
+                self._last_ws_err[url] = repr(e)
                 logger.error(f"[sakurabridge] ws {url} disconnected: {e!r}")
             finally:
                 try:
@@ -90,6 +126,7 @@ class SakuraBridge(Star):
                 data = json.loads(raw)
             except Exception:
                 continue
+            # 仅处理 OneBot v11 的 action 请求
             if isinstance(data, dict) and "action" in data:
                 await self._handle_action(ws, data)
 
@@ -97,12 +134,13 @@ class SakuraBridge(Star):
         action = packet.get("action")
         params = packet.get("params", {}) or {}
         echo = packet.get("echo")
+        # 把 OneBot 段转 AstrBot 的 MessageChain
         chains = self._ob_message_to_chain(params.get("message"))
 
-        # 选择回发目标
+        # 选择回发目标（优先群）
         target_key: Optional[str] = None
         if "group_id" in params:
-            gid = str(params["group_id"])  # 来自 Sakura 的 ID
+            gid = str(params["group_id"])  # 来自 Sakura 的 ID（OneBot 侧）
             target_key = f"group:{gid}"
         elif "user_id" in params:
             uid = str(params["user_id"])  # 兼容私聊
@@ -156,6 +194,10 @@ class SakuraBridge(Star):
 
         logger.debug(f"[sakurabridge] got message: {event.message_str!r}")
 
+        # 更新 self_id（用于握手头）
+        if getattr(event, "message_obj", None) and getattr(event.message_obj, "self_id", None):
+            self._self_id = str(event.message_obj.self_id)
+
         # 记录回发路由：优先群，其次私聊
         if event.get_group_id():
             gid_official = str(event.get_group_id())
@@ -190,7 +232,7 @@ class SakuraBridge(Star):
 
         return {
             "time": _now_ts(),
-            "self_id": event.message_obj.self_id or "astrbot",
+            "self_id": event.message_obj.self_id or self._self_id or "astrbot",
             "post_type": "message",
             "message_type": "group" if is_group else "private",
             "sub_type": "normal",
@@ -217,4 +259,39 @@ class SakuraBridge(Star):
             f"ws_started={self._ws_started}, peers={len(self._ws_peers)}, "
             f"sessions={len(self._session_map)}, urls={len(SAKURA_WS_URLS)}"
         )
+        # 附带错误摘要
+        if self._last_ws_err:
+            txt += "last_errors:" + "; ".join([f"{k}={v}" for k, v in self._last_ws_err.items()])
+        if self._last_ws_status:
+            txt += "status:" + "; ".join([f"{k}={v}" for k, v in self._last_ws_status.items()])
         yield event.plain_result(f"sakurabridge: {txt}")
+
+    # --- 动态添加 WS：@机器人 /sblink <ws-url> ---
+    @filter.command("sblink")
+    async def _sblink(self, event: AstrMessageEvent):
+        url = event.get_plain_text().strip().split(maxsplit=1)
+        if len(url) < 2:
+            yield event.plain_result("用法：/sblink ws://host:port/path")
+            return
+        raw = url[1].strip()
+        url = _with_token(raw, SAKURA_ACCESS_TOKEN)
+        try:
+            # 启动一个新的连接任务
+            self._ws_tasks.append(asyncio.create_task(self._run_onebot_client(url)))
+            yield event.plain_result(f"sakurabridge: linking {url}")
+        except Exception as e:
+            yield event.plain_result(f"sakurabridge: link failed: {e}")
+
+    # --- 主动探测所有连接：@机器人 /sbprobe ---
+    @filter.command("sbprobe")
+    async def _sbprobe(self, event: AstrMessageEvent):
+        await self._ensure_ws_started()
+        lines = []
+        for raw in SAKURA_WS_URLS:
+            url = _with_token(raw, SAKURA_ACCESS_TOKEN)
+            st = self._last_ws_status.get(url, "init")
+            err = self._last_ws_err.get(url, "")
+            lines.append(f"{url} -> {st}{' | ' + err if err else ''}")
+        if not lines:
+            lines = ["(no urls configured)"]
+        yield event.plain_result("".join(lines))
